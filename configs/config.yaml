@@ -1,0 +1,21 @@
+http:
+  listen_address: ":8080"
+
+backends:
+  # 本地开发：gateway 在宿主机上跑，通过 127.0.0.1 访问 account 容器映射的 gRPC 端口。
+  # 如果后续将 gateway 也放进 docker，并与 account 在同一 network，则可以改为：
+  # addr: "assistant-account-app:50051"
+  - name: "account"
+    addr: "127.0.0.1:50051"
+
+routes:
+  # Strongly-typed login route to assistant_account user service.
+  - http_method: "POST"
+    http_pattern: "/v1/user/login"
+    backend_name: "account"
+    backend_service: "user.v1.UserService"
+    backend_method: "Login"
+    timeout_ms: 1000
+    request_type: "user.v1.LoginRequest"
+    response_type: "user.v1.LoginResponse"
+

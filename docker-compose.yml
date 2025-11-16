@@ -1,0 +1,20 @@
+services:
+  gateway:
+    build: .
+    image: assistant-gateway:latest
+    container_name: assistant-gateway-app
+    restart: unless-stopped
+    environment:
+      # Use docker-specific config so backend addr 指向 account 容器名
+      GATEWAY_CONFIG: "/app/configs/config.docker.yaml"
+    ports:
+      - "8080:8080"
+    networks:
+      - assistant-net
+
+networks:
+  # 复用 account 项目中定义的 assistant-net 网络
+  assistant-net:
+    external: true
+
+
