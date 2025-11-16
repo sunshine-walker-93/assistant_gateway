@@ -11,8 +11,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
-	"github.com/example/assistant_gateway/internal/config"
-	"github.com/example/assistant_gateway/internal/grpcclient"
+	"github.com/sunshine-walker-93/assistant_gateway/internal/config"
+	"github.com/sunshine-walker-93/assistant_gateway/internal/grpcclient"
 )
 
 // RegisterRoutes wires public gateway routes and simple admin endpoints.

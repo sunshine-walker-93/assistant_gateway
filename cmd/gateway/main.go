@@ -11,9 +11,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/example/assistant_gateway/internal/config"
-	ghttp "github.com/example/assistant_gateway/internal/http"
-	"github.com/example/assistant_gateway/internal/middleware"
+	"github.com/sunshine-walker-93/assistant_gateway/internal/config"
+	ghttp "github.com/sunshine-walker-93/assistant_gateway/internal/http"
+	"github.com/sunshine-walker-93/assistant_gateway/internal/middleware"
 )
 
 func main() {

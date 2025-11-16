@@ -13,8 +13,9 @@ services:
       - assistant-net
 
 networks:
-  # 复用 account 项目中定义的 assistant-net 网络
+  # 复用 account 项目中由 docker compose 创建的 assistant_assistant-net 网络
   assistant-net:
-    external: true
+    external:
+      name: assistant_assistant-net
 
 
