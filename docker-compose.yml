@@ -5,8 +5,18 @@ services:
     container_name: assistant-gateway-app
     restart: unless-stopped
     environment:
-      # Use docker-specific config so backend addr 指向 account 容器名
-      GATEWAY_CONFIG: "/app/configs/config.docker.yaml"
+      # Database connection parameters (same as assistant_account project)
+      DB_HOST: ${DB_HOST:-assistant-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-assistant_gateway_db}
+      DB_USER: ${DB_USER:-assistant}
+      DB_PASSWORD: ${DB_PASSWORD:-${MYSQL_PASSWORD}}
+      # MySQL credentials (for backward compatibility)
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change_me_password}
+      # Config polling interval in seconds (default: 5)
+      GATEWAY_CONFIG_POLL_INTERVAL: ${GATEWAY_CONFIG_POLL_INTERVAL:-5}
+      # HTTP listen address (default: :8080)
+      GATEWAY_HTTP_LISTEN: ${GATEWAY_HTTP_LISTEN:-:8080}
     ports:
       - "8080:8080"
     networks:
@@ -14,6 +24,7 @@ services:
 
 networks:
   # 复用 account 项目中由 docker compose 创建的 assistant_assistant-net 网络
+  # 共享同一个 MySQL 容器（assistant-mysql）
   assistant-net:
     external:
       name: assistant_assistant-net

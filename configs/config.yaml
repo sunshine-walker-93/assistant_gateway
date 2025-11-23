@@ -9,13 +9,12 @@ backends:
     addr: "127.0.0.1:50051"
 
 routes:
-  # Strongly-typed login route to assistant_account user service.
+  # Login route to assistant_account user service.
+  # Note: request_type and response_type are optional metadata fields for documentation only.
   - http_method: "POST"
     http_pattern: "/v1/user/login"
     backend_name: "account"
     backend_service: "user.v1.UserService"
     backend_method: "Login"
     timeout_ms: 1000
-    request_type: "user.v1.LoginRequest"
-    response_type: "user.v1.LoginResponse"
 
