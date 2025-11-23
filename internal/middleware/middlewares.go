@@ -9,12 +9,13 @@ import (
 )
 
 // RegisterGlobalMiddlewares installs global middlewares on the router.
-// It includes request ID, recover, and structured logging.
+// It includes request ID, recover, CORS, and structured logging.
 func RegisterGlobalMiddlewares(r interface {
 	Use(middlewares ...func(http.Handler) http.Handler)
 }, logger *zap.Logger) {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
+	r.Use(CORSMiddleware) // CORS should be early in the chain, before auth
 	r.Use(MetricsMiddleware)
 	r.Use(RateLimitMiddleware(100, 100))
 	r.Use(APIKeyAuthMiddleware)

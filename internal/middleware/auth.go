@@ -15,6 +15,12 @@ func APIKeyAuthMiddleware(next http.Handler) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip authentication for OPTIONS preflight requests
+		if r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		key := r.Header.Get("X-API-Key")
 		if key == "" || key != requiredKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
