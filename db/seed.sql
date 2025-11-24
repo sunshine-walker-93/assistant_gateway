@@ -96,15 +96,16 @@ ON DUPLICATE KEY UPDATE
     description = VALUES(description),
     enabled = VALUES(enabled);
 
--- 可选：插入更多测试路由示例
--- INSERT INTO routes (http_method, http_pattern, backend_name, backend_service, backend_method, timeout_ms, description, enabled) VALUES
--- ('POST', '/v1/user/register', 'account', 'user.v1.UserService', 'Register', 5000, 'User registration route', 1),
--- ('GET', '/v1/user/{id}', 'account', 'user.v1.UserService', 'GetUser', 3000, 'Get user by ID route', 1)
--- ON DUPLICATE KEY UPDATE 
---     backend_name = VALUES(backend_name),
---     backend_service = VALUES(backend_service),
---     backend_method = VALUES(backend_method),
---     timeout_ms = VALUES(timeout_ms),
---     description = VALUES(description),
---     enabled = VALUES(enabled);
+-- 插入更多用户管理路由
+INSERT INTO routes (http_method, http_pattern, backend_name, backend_service, backend_method, timeout_ms, description, enabled) VALUES
+('POST', '/v1/user/register', 'account', 'user.v1.UserService', 'Register', 5000, 'User registration route', 1),
+('POST', '/v1/user/get', 'account', 'user.v1.UserService', 'GetUser', 5000, 'Get user by ID route', 1),
+('POST', '/v1/user/update', 'account', 'user.v1.UserService', 'UpdateUser', 5000, 'Update user info route', 1)
+ON DUPLICATE KEY UPDATE 
+    backend_name = VALUES(backend_name),
+    backend_service = VALUES(backend_service),
+    backend_method = VALUES(backend_method),
+    timeout_ms = VALUES(timeout_ms),
+    description = VALUES(description),
+    enabled = VALUES(enabled);
 
