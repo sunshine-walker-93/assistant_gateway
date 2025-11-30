@@ -5,6 +5,9 @@ backends:
   # 在 docker 网络 assistant-net 中，通过服务名访问 account 容器。
   - name: "account"
     addr: "assistant-account-app:50051"
+  - name: "ai"
+    addr: "assistant-ai-app:50051"
+    description: "AI Service with LangChain/LangGraph agents"
 
 routes:
   # Login route to assistant_account user service.
@@ -15,5 +18,30 @@ routes:
     backend_service: "user.v1.UserService"
     backend_method: "Login"
     timeout_ms: 1000
+  
+  # AI Service routes
+  - http_method: "POST"
+    http_pattern: "/v1/ai/process"
+    backend_name: "ai"
+    backend_service: "ai.v1.AIService"
+    backend_method: "Process"
+    timeout_ms: 60000
+    description: "Unified entry point for AI processing"
+  
+  - http_method: "POST"
+    http_pattern: "/v1/ai/process/stream"
+    backend_name: "ai"
+    backend_service: "ai.v1.AIService"
+    backend_method: "ProcessStream"
+    timeout_ms: 60000
+    description: "Streaming AI response"
+  
+  - http_method: "GET"
+    http_pattern: "/v1/ai/agents"
+    backend_name: "ai"
+    backend_service: "ai.v1.AIService"
+    backend_method: "ListAgents"
+    timeout_ms: 5000
+    description: "List available AI agents"
 
 
