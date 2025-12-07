@@ -24,9 +24,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	rand "math/rand/v2"
+	"math/rand"
 	"net"
-	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -123,7 +122,7 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	}
 
 	// IP address.
-	if ipAddr, err := formatIP(host); err == nil {
+	if ipAddr, ok := formatIP(host); ok {
 		addr := []resolver.Address{{Addr: ipAddr + ":" + port}}
 		cc.UpdateState(resolver.State{Addresses: addr})
 		return deadResolver{}, nil
@@ -132,13 +131,13 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	// DNS address (non-IP).
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &dnsResolver{
-		host:                host,
-		port:                port,
-		ctx:                 ctx,
-		cancel:              cancel,
-		cc:                  cc,
-		rn:                  make(chan struct{}, 1),
-		enableServiceConfig: envconfig.EnableTXTServiceConfig && !opts.DisableServiceConfig,
+		host:                 host,
+		port:                 port,
+		ctx:                  ctx,
+		cancel:               cancel,
+		cc:                   cc,
+		rn:                   make(chan struct{}, 1),
+		disableServiceConfig: opts.DisableServiceConfig,
 	}
 
 	d.resolver, err = internal.NewNetResolver(target.URL.Host)
@@ -181,8 +180,8 @@ type dnsResolver struct {
 	// finishes, race detector sometimes will warn lookup (READ the lookup
 	// function pointers) inside watcher() goroutine has data race with
 	// replaceNetFunc (WRITE the lookup function pointers).
-	wg                  sync.WaitGroup
-	enableServiceConfig bool
+	wg                   sync.WaitGroup
+	disableServiceConfig bool
 }
 
 // ResolveNow invoke an immediate resolution of the target that this
@@ -238,9 +237,7 @@ func (d *dnsResolver) watcher() {
 }
 
 func (d *dnsResolver) lookupSRV(ctx context.Context) ([]resolver.Address, error) {
-	// Skip this particular host to avoid timeouts with some versions of
-	// systemd-resolved.
-	if !EnableSRVLookups || d.host == "metadata.google.internal." {
+	if !EnableSRVLookups {
 		return nil, nil
 	}
 	var newAddrs []resolver.Address
@@ -261,9 +258,9 @@ func (d *dnsResolver) lookupSRV(ctx context.Context) ([]resolver.Address, error)
 			return nil, err
 		}
 		for _, a := range lbAddrs {
-			ip, err := formatIP(a)
-			if err != nil {
-				return nil, fmt.Errorf("dns: error parsing A record IP address %v: %v", a, err)
+			ip, ok := formatIP(a)
+			if !ok {
+				return nil, fmt.Errorf("dns: error parsing A record IP address %v", a)
 			}
 			addr := ip + ":" + strconv.Itoa(int(s.Port))
 			newAddrs = append(newAddrs, resolver.Address{Addr: addr, ServerName: s.Target})
@@ -323,9 +320,9 @@ func (d *dnsResolver) lookupHost(ctx context.Context) ([]resolver.Address, error
 	}
 	newAddrs := make([]resolver.Address, 0, len(addrs))
 	for _, a := range addrs {
-		ip, err := formatIP(a)
-		if err != nil {
-			return nil, fmt.Errorf("dns: error parsing A record IP address %v: %v", a, err)
+		ip, ok := formatIP(a)
+		if !ok {
+			return nil, fmt.Errorf("dns: error parsing A record IP address %v", a)
 		}
 		addr := ip + ":" + d.port
 		newAddrs = append(newAddrs, resolver.Address{Addr: addr})
@@ -346,25 +343,25 @@ func (d *dnsResolver) lookup() (*resolver.State, error) {
 	if len(srv) > 0 {
 		state = grpclbstate.Set(state, &grpclbstate.State{BalancerAddresses: srv})
 	}
-	if d.enableServiceConfig {
+	if !d.disableServiceConfig {
 		state.ServiceConfig = d.lookupTXT(ctx)
 	}
 	return &state, nil
 }
 
-// formatIP returns an error if addr is not a valid textual representation of
-// an IP address. If addr is an IPv4 address, return the addr and error = nil.
+// formatIP returns ok = false if addr is not a valid textual representation of
+// an IP address. If addr is an IPv4 address, return the addr and ok = true.
 // If addr is an IPv6 address, return the addr enclosed in square brackets and
-// error = nil.
-func formatIP(addr string) (string, error) {
-	ip, err := netip.ParseAddr(addr)
-	if err != nil {
-		return "", err
+// ok = true.
+func formatIP(addr string) (addrIP string, ok bool) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return "", false
 	}
-	if ip.Is4() {
-		return addr, nil
+	if ip.To4() != nil {
+		return addr, true
 	}
-	return "[" + addr + "]", nil
+	return "[" + addr + "]", true
 }
 
 // parseTarget takes the user input target string and default port, returns
@@ -380,7 +377,7 @@ func parseTarget(target, defaultPort string) (host, port string, err error) {
 	if target == "" {
 		return "", "", internal.ErrMissingAddr
 	}
-	if _, err := netip.ParseAddr(target); err == nil {
+	if ip := net.ParseIP(target); ip != nil {
 		// target is an IPv4 or IPv6(without brackets) address
 		return target, defaultPort, nil
 	}
@@ -428,7 +425,7 @@ func chosenByPercentage(a *int) bool {
 	if a == nil {
 		return true
 	}
-	return rand.IntN(100)+1 <= *a
+	return rand.Intn(100)+1 <= *a
 }
 
 func canaryingSC(js string) string {

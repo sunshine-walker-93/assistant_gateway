@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -40,8 +41,9 @@ type ClientManager struct {
 
 // typeInfo stores request and response type names for a method
 type typeInfo struct {
-	requestType  string
-	responseType string
+	requestType    string
+	responseType   string
+	isServerStream bool
 }
 
 // NewClientManager creates a new ClientManager.
@@ -159,21 +161,40 @@ func (m *ClientManager) getReflectionClient(ctx context.Context, addr string) (r
 }
 
 // getTypeNamesFromReflection uses gRPC reflection to get request/response type names for a method.
-func (m *ClientManager) getTypeNamesFromReflection(ctx context.Context, addr, fullMethod string) (requestType, responseType string, err error) {
-	client, err := m.getReflectionClient(ctx, addr)
+func (m *ClientManager) getTypeNamesFromReflection(ctx context.Context, addr, fullMethod string) (requestType, responseType string, isServerStream bool, err error) {
+	// For first-time queries, use a longer timeout to accommodate slow reflection queries
+	queryCtx := ctx
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		// If context has a deadline, extend it for first-time queries
+		timeRemaining := time.Until(deadline)
+		if timeRemaining < 10*time.Second {
+			// Extend timeout to at least 15 seconds for first-time reflection queries
+			// Use context.Background() to avoid inheriting the parent's deadline
+			var cancel context.CancelFunc
+			queryCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+		}
+	} else {
+		// No deadline, set a reasonable timeout for reflection queries
+		var cancel context.CancelFunc
+		queryCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+	}
+
+	client, err := m.getReflectionClient(queryCtx, addr)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get reflection client: %w", err)
+		return "", "", false, fmt.Errorf("failed to get reflection client: %w", err)
 	}
 
 	serviceName, methodName := parseMethodName(fullMethod)
 	if serviceName == "" || methodName == "" {
-		return "", "", fmt.Errorf("failed to parse method name: %s", fullMethod)
+		return "", "", false, fmt.Errorf("failed to parse method name: %s", fullMethod)
 	}
 
 	// Query for file containing the service
-	stream, err := client.ServerReflectionInfo(ctx)
+	stream, err := client.ServerReflectionInfo(queryCtx)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create reflection stream: %w", err)
+		return "", "", false, fmt.Errorf("failed to create reflection stream: %w", err)
 	}
 	defer stream.CloseSend()
 
@@ -184,21 +205,21 @@ func (m *ClientManager) getTypeNamesFromReflection(ctx context.Context, addr, fu
 			FileContainingSymbol: serviceSymbol,
 		},
 	}); err != nil {
-		return "", "", fmt.Errorf("failed to send reflection request: %w", err)
+		return "", "", false, fmt.Errorf("failed to send reflection request: %w", err)
 	}
 
 	resp, err := stream.Recv()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to receive reflection response: %w", err)
+		return "", "", false, fmt.Errorf("failed to receive reflection response: %w", err)
 	}
 
 	if resp.GetErrorResponse() != nil {
-		return "", "", fmt.Errorf("reflection error: %d - %s", resp.GetErrorResponse().GetErrorCode(), resp.GetErrorResponse().GetErrorMessage())
+		return "", "", false, fmt.Errorf("reflection error: %d - %s", resp.GetErrorResponse().GetErrorCode(), resp.GetErrorResponse().GetErrorMessage())
 	}
 
 	fileResp := resp.GetFileDescriptorResponse()
 	if fileResp == nil {
-		return "", "", fmt.Errorf("unexpected reflection response type")
+		return "", "", false, fmt.Errorf("unexpected reflection response type")
 	}
 
 	// Parse FileDescriptorSet to find method and extract types
@@ -212,12 +233,12 @@ func (m *ClientManager) getTypeNamesFromReflection(ctx context.Context, addr, fu
 		fileDescs = append(fileDescs, fd)
 	}
 
-	requestType, responseType, err = extractTypesFromFileDescriptorSet(fileDescs, serviceName, methodName)
+	requestType, responseType, isServerStream, err = extractTypesFromFileDescriptorSet(fileDescs, serviceName, methodName)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to extract types: %w", err)
+		return "", "", false, fmt.Errorf("failed to extract types: %w", err)
 	}
 
-	return requestType, responseType, nil
+	return requestType, responseType, isServerStream, nil
 }
 
 // getFilesFromReflection gets Files from gRPC reflection and caches them.
@@ -230,13 +251,33 @@ func (m *ClientManager) getFilesFromReflection(ctx context.Context, addr string)
 		return files, nil
 	}
 
-	client, err := m.getReflectionClient(ctx, addr)
+	// For first-time queries, use a longer timeout to accommodate slow reflection queries
+	// Check if this is a first-time query (cache is empty)
+	queryCtx := ctx
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		// If context has a deadline, extend it for first-time queries
+		timeRemaining := time.Until(deadline)
+		if timeRemaining < 10*time.Second {
+			// Extend timeout to at least 15 seconds for first-time reflection queries
+			// Use context.Background() to avoid inheriting the parent's deadline
+			var cancel context.CancelFunc
+			queryCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+		}
+	} else {
+		// No deadline, set a reasonable timeout for reflection queries
+		var cancel context.CancelFunc
+		queryCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+	}
+
+	client, err := m.getReflectionClient(queryCtx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get reflection client: %w", err)
 	}
 
 	// Query for all services to get FileDescriptorSet
-	stream, err := client.ServerReflectionInfo(ctx)
+	stream, err := client.ServerReflectionInfo(queryCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reflection stream: %w", err)
 	}
@@ -395,7 +436,7 @@ func extractServiceTypeName(fullMethod string) string {
 }
 
 // extractTypesFromFileDescriptorSet extracts request/response type names from FileDescriptorSet.
-func extractTypesFromFileDescriptorSet(fds []*descriptorpb.FileDescriptorProto, serviceName, methodName string) (requestType, responseType string, err error) {
+func extractTypesFromFileDescriptorSet(fds []*descriptorpb.FileDescriptorProto, serviceName, methodName string) (requestType, responseType string, isServerStream bool, err error) {
 	// Find the service in the file descriptors
 	for _, fd := range fds {
 		pkg := fd.GetPackage()
@@ -418,6 +459,8 @@ func extractTypesFromFileDescriptorSet(fds []*descriptorpb.FileDescriptorProto, 
 						// These are already fully qualified (e.g., ".user.v1.LoginRequest" or "user.v1.LoginRequest")
 						requestType = method.GetInputType()
 						responseType = method.GetOutputType()
+						// Check if server streaming (response is stream)
+						isServerStream = method.GetServerStreaming()
 						// Remove leading dot if present
 						if len(requestType) > 0 && requestType[0] == '.' {
 							requestType = requestType[1:]
@@ -425,41 +468,42 @@ func extractTypesFromFileDescriptorSet(fds []*descriptorpb.FileDescriptorProto, 
 						if len(responseType) > 0 && responseType[0] == '.' {
 							responseType = responseType[1:]
 						}
-						return requestType, responseType, nil
+						return requestType, responseType, isServerStream, nil
 					}
 				}
 			}
 		}
 	}
 
-	return "", "", fmt.Errorf("method %s not found in service %s", methodName, serviceName)
+	return "", "", false, fmt.Errorf("method %s not found in service %s", methodName, serviceName)
 }
 
 // getTypeNames gets request/response type names for a method, using cache or reflection.
-func (m *ClientManager) getTypeNames(ctx context.Context, addr, fullMethod string) (requestType, responseType string, err error) {
+func (m *ClientManager) getTypeNames(ctx context.Context, addr, fullMethod string) (requestType, responseType string, isServerStream bool, err error) {
 	// Check cache first
 	m.mu.Lock()
 	info, ok := m.typeCache[fullMethod]
 	m.mu.Unlock()
 	if ok {
-		return info.requestType, info.responseType, nil
+		return info.requestType, info.responseType, info.isServerStream, nil
 	}
 
 	// Use reflection to get type names (no inference needed, pure reflection approach)
-	requestType, responseType, err = m.getTypeNamesFromReflection(ctx, addr, fullMethod)
+	requestType, responseType, isServerStream, err = m.getTypeNamesFromReflection(ctx, addr, fullMethod)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	// Cache the result
 	m.mu.Lock()
 	m.typeCache[fullMethod] = typeInfo{
-		requestType:  requestType,
-		responseType: responseType,
+		requestType:    requestType,
+		responseType:   responseType,
+		isServerStream: isServerStream,
 	}
 	m.mu.Unlock()
 
-	return requestType, responseType, nil
+	return requestType, responseType, isServerStream, nil
 }
 
 // InvokeJSON uses gRPC reflection to dynamically get request/response types,
@@ -476,16 +520,46 @@ func (m *ClientManager) InvokeJSON(
 		return nil, err
 	}
 
+	// Check if this is a first-time query (cache is empty) to extend timeout
+	m.mu.Lock()
+	_, hasFilesCache := m.filesCache[addr]
+	_, hasTypeCache := m.typeCache[fullMethod]
+	m.mu.Unlock()
+	isFirstTimeQuery := !hasFilesCache || !hasTypeCache
+
+	// For first-time queries, extend timeout to accommodate slow reflection queries
+	invokeCtx := ctx
+	if isFirstTimeQuery {
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			timeRemaining := time.Until(deadline)
+			if timeRemaining < 10*time.Second {
+				// Extend timeout to at least 15 seconds for first-time queries
+				var cancel context.CancelFunc
+				invokeCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+			}
+		} else {
+			var cancel context.CancelFunc
+			invokeCtx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+		}
+	}
+
 	// Get Files from reflection (cached)
-	files, err := m.getFilesFromReflection(ctx, addr)
+	files, err := m.getFilesFromReflection(invokeCtx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Files from reflection: %w", err)
 	}
 
 	// Try to get type names using reflection or inference
-	requestType, responseType, err := m.getTypeNames(ctx, addr, fullMethod)
+	requestType, responseType, isServerStream, err := m.getTypeNames(invokeCtx, addr, fullMethod)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get type names: %w", err)
+	}
+
+	// If this is a server streaming method, it should use InvokeStream instead
+	if isServerStream {
+		return nil, fmt.Errorf("method %s is a server streaming method, use InvokeStream instead", fullMethod)
 	}
 
 	// Get message types from Files
@@ -510,8 +584,8 @@ func (m *ClientManager) InvokeJSON(
 		}
 	}
 
-	// Invoke gRPC method
-	if err := conn.Invoke(ctx, fullMethod, reqMsg, respMsg); err != nil {
+	// Invoke gRPC method (use invokeCtx which has extended timeout for first-time queries)
+	if err := conn.Invoke(invokeCtx, fullMethod, reqMsg, respMsg); err != nil {
 		return nil, err
 	}
 
@@ -525,6 +599,129 @@ func (m *ClientManager) InvokeJSON(
 	}
 
 	return respJSON, nil
+}
+
+// InvokeJSONStream invokes a server-streaming gRPC method using reflection.
+// It returns a channel of JSON messages that the caller should read from.
+// The channel is closed when the stream ends or an error occurs.
+func (m *ClientManager) InvokeJSONStream(
+	ctx context.Context,
+	addr string,
+	fullMethod string,
+	reqJSON json.RawMessage,
+) (<-chan json.RawMessage, <-chan error, error) {
+	conn, err := m.GetConn(ctx, addr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Get Files from reflection (cached)
+	files, err := m.getFilesFromReflection(ctx, addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get Files from reflection: %w", err)
+	}
+
+	// Get type names using reflection
+	requestType, responseType, isServerStream, err := m.getTypeNames(ctx, addr, fullMethod)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get type names: %w", err)
+	}
+
+	// Ensure this is actually a server streaming method
+	if !isServerStream {
+		return nil, nil, fmt.Errorf("method %s is not a server streaming method", fullMethod)
+	}
+
+	// Get message types from Files
+	reqMsgType, err := m.getMessageTypeFromFiles(files, requestType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get request message type: %w", err)
+	}
+
+	respMsgType, err := m.getMessageTypeFromFiles(files, responseType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get response message type: %w", err)
+	}
+
+	// Create proto message instance for request
+	reqMsg := reqMsgType.New().Interface().(proto.Message)
+
+	// Convert JSON to proto request
+	if len(reqJSON) > 0 {
+		if err := protojson.Unmarshal(reqJSON, reqMsg); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal JSON to proto: %w", err)
+		}
+	}
+
+	// Create stream description
+	streamDesc := &grpc.StreamDesc{
+		StreamName:    fullMethod,
+		ServerStreams: true,
+		ClientStreams: false,
+	}
+
+	// Create the stream
+	stream, err := conn.NewStream(ctx, streamDesc, fullMethod)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create stream: %w", err)
+	}
+
+	// Send the request
+	if err := stream.SendMsg(reqMsg); err != nil {
+		return nil, nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Close the send side of the stream
+	if err := stream.CloseSend(); err != nil {
+		return nil, nil, fmt.Errorf("failed to close send: %w", err)
+	}
+
+	// Create channels for streaming results
+	msgChan := make(chan json.RawMessage, 10)
+	errChan := make(chan error, 1)
+
+	// Start goroutine to receive stream messages
+	go func() {
+		defer close(msgChan)
+		defer close(errChan)
+
+		marshaler := protojson.MarshalOptions{
+			EmitUnpopulated: true,
+		}
+
+		for {
+			// Create a new response message for each iteration
+			respMsg := respMsgType.New().Interface().(proto.Message)
+
+			// Receive message from stream
+			if err := stream.RecvMsg(respMsg); err != nil {
+				if err == io.EOF {
+					// Stream ended normally
+					return
+				}
+				// Stream ended with error
+				errChan <- fmt.Errorf("failed to receive message: %w", err)
+				return
+			}
+
+			// Convert proto response to JSON
+			respJSON, err := marshaler.Marshal(respMsg)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to marshal proto to JSON: %w", err)
+				return
+			}
+
+			// Send JSON to channel
+			select {
+			case msgChan <- respJSON:
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			}
+		}
+	}()
+
+	return msgChan, errChan, nil
 }
 
 // InvokeProto performs a strongly-typed gRPC invocation using JSON as the wire

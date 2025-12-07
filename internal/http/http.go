@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +95,15 @@ func (rm *RouteManager) createHandler(route config.RouteConfig) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
-		ctx, cancel := context.WithTimeout(ctx, timeout)
+
+		// For routes with short timeout (< 10s), extend to 15s to accommodate first-time
+		// gRPC reflection queries which can be slow. This is a compatibility measure.
+		actualTimeout := timeout
+		if timeout < 10*time.Second {
+			actualTimeout = 15 * time.Second
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, actualTimeout)
 		defer cancel()
 
 		var body json.RawMessage
@@ -119,14 +128,45 @@ func (rm *RouteManager) createHandler(route config.RouteConfig) http.Handler {
 			return
 		}
 
-		// Always use InvokeJSON for zero-code configuration
-		// This requires backend services to accept google.protobuf.Struct as request/response
-		respJSON, err := rm.clientMgr.InvokeJSON(ctx, addr, fullMethod, body)
-		if err != nil {
-			// Map gRPC error to appropriate HTTP status code
-			httpStatus, errorMsg := grpcErrorToHTTPStatus(err)
+		// Only try streaming for routes that explicitly indicate streaming (e.g., /stream in path)
+		// This avoids unnecessary reflection queries for unary methods
+		isStreamingRoute := strings.Contains(route.HTTPPattern, "/stream")
 
-			rm.logger.Error("grpc_invoke_failed",
+		if !isStreamingRoute {
+			// Direct unary invocation for non-streaming routes
+			rm.handleUnaryInvocation(w, req, ctx, addr, fullMethod, body, route)
+			return
+		}
+
+		// Try to invoke as streaming for streaming routes
+		msgChan, errChan, err := rm.clientMgr.InvokeJSONStream(ctx, addr, fullMethod, body)
+		if err != nil {
+			// Check if the error is because it's not a streaming method
+			// Also fall back to unary on timeout errors (reflection may be slow)
+			errMsg := err.Error()
+			isNotStreaming := errMsg == "method "+fullMethod+" is not a server streaming method"
+			isTimeout := ctx.Err() == context.DeadlineExceeded || errMsg == "context deadline exceeded"
+
+			if isNotStreaming || isTimeout {
+				// Fall back to unary invocation
+				if isTimeout {
+					rm.logger.Debug("stream_setup_timeout_fallback_to_unary",
+						zap.String("backend_name", route.BackendName),
+						zap.String("full_method", fullMethod),
+					)
+					// Create a new context with the same timeout for unary call
+					// (original context was cancelled due to timeout)
+					var unaryCancel context.CancelFunc
+					ctx, unaryCancel = context.WithTimeout(req.Context(), timeout)
+					defer unaryCancel()
+				}
+				rm.handleUnaryInvocation(w, req, ctx, addr, fullMethod, body, route)
+				return
+			}
+
+			// Other errors during stream setup
+			httpStatus, errorMsg := grpcErrorToHTTPStatus(err)
+			rm.logger.Error("grpc_stream_setup_failed",
 				zap.String("backend_name", route.BackendName),
 				zap.String("backend_addr", addr),
 				zap.String("full_method", fullMethod),
@@ -134,7 +174,6 @@ func (rm *RouteManager) createHandler(route config.RouteConfig) http.Handler {
 				zap.Error(err),
 			)
 
-			// Return error as JSON for better client experience
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(httpStatus)
 			errorResp := map[string]string{
@@ -146,11 +185,105 @@ func (rm *RouteManager) createHandler(route config.RouteConfig) http.Handler {
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		if _, err := w.Write(respJSON); err != nil {
-			rm.logger.Warn("write_response_failed", zap.Error(err))
-		}
+		// Handle streaming response with newline-delimited JSON
+		rm.handleStreamingResponse(w, msgChan, errChan, route)
 	})
+}
+
+// handleUnaryInvocation handles a unary (non-streaming) gRPC call
+func (rm *RouteManager) handleUnaryInvocation(w http.ResponseWriter, req *http.Request, ctx context.Context, addr, fullMethod string, body json.RawMessage, route config.RouteConfig) {
+	respJSON, err := rm.clientMgr.InvokeJSON(ctx, addr, fullMethod, body)
+	if err != nil {
+		// Map gRPC error to appropriate HTTP status code
+		httpStatus, errorMsg := grpcErrorToHTTPStatus(err)
+
+		rm.logger.Error("grpc_invoke_failed",
+			zap.String("backend_name", route.BackendName),
+			zap.String("backend_addr", addr),
+			zap.String("full_method", fullMethod),
+			zap.Int("http_status", httpStatus),
+			zap.Error(err),
+		)
+
+		// Return error as JSON for better client experience
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(httpStatus)
+		errorResp := map[string]string{
+			"error": errorMsg,
+		}
+		if err := json.NewEncoder(w).Encode(errorResp); err != nil {
+			rm.logger.Warn("write_error_response_failed", zap.Error(err))
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if _, err := w.Write(respJSON); err != nil {
+		rm.logger.Warn("write_response_failed", zap.Error(err))
+	}
+}
+
+// handleStreamingResponse handles streaming gRPC responses and writes them as newline-delimited JSON
+func (rm *RouteManager) handleStreamingResponse(w http.ResponseWriter, msgChan <-chan json.RawMessage, errChan <-chan error, route config.RouteConfig) {
+	// Set headers for streaming response
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	// Get flusher for real-time streaming
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		rm.logger.Error("streaming_not_supported", zap.String("route", route.HTTPPattern))
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Write status code
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Stream messages to client
+	for {
+		select {
+		case msg, ok := <-msgChan:
+			if !ok {
+				// Channel closed, streaming complete
+				return
+			}
+
+			// Write message as a line of newline-delimited JSON
+			if _, err := w.Write(msg); err != nil {
+				rm.logger.Warn("write_stream_message_failed", zap.Error(err))
+				return
+			}
+			if _, err := w.Write([]byte("\n")); err != nil {
+				rm.logger.Warn("write_newline_failed", zap.Error(err))
+				return
+			}
+
+			// Flush immediately for real-time streaming
+			flusher.Flush()
+
+		case err := <-errChan:
+			if err != nil {
+				rm.logger.Error("stream_error",
+					zap.String("backend_name", route.BackendName),
+					zap.String("route", route.HTTPPattern),
+					zap.Error(err),
+				)
+				// Write error as a JSON line
+				errorResp := map[string]string{
+					"error": err.Error(),
+				}
+				if errJSON, jsonErr := json.Marshal(errorResp); jsonErr == nil {
+					w.Write(errJSON)
+					w.Write([]byte("\n"))
+					flusher.Flush()
+				}
+			}
+			return
+		}
+	}
 }
 
 // RegisterAllRoutes registers all routes from configuration.
